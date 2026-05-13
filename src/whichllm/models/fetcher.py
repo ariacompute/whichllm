@@ -181,8 +181,120 @@ def _estimate_gguf_size(param_count: int, quant_type: str) -> int:
     return int(param_count * bpw)
 
 
+# Curated MoE active-parameter counts. Used when HF config lacks the
+# `num_local_experts` / `num_experts_per_tok` keys that whichllm reads.
+# Without this, frontier MoEs are scored as dense models which over-counts
+# their VRAM cost and under-counts their inference speed.
+_KNOWN_MOE_ACTIVE_PARAMS: dict[str, int] = {
+    "meta-llama/Llama-4-Scout-17B-16E-Instruct":      17_000_000_000,
+    "meta-llama/Llama-4-Maverick-17B-128E-Instruct":  17_000_000_000,
+    "Qwen/Qwen3-Next-80B-A3B-Instruct":                3_000_000_000,
+    "Qwen/Qwen3-30B-A3B":                              3_000_000_000,
+    "Qwen/Qwen3-Coder-30B-A3B-Instruct":               3_000_000_000,
+    "Qwen/Qwen3-235B-A22B":                           22_000_000_000,
+    "Qwen/Qwen3.5-397B-A17B":                         17_000_000_000,
+    "deepseek-ai/DeepSeek-V3":                        37_000_000_000,
+    "deepseek-ai/DeepSeek-V3-0324":                   37_000_000_000,
+    "deepseek-ai/DeepSeek-V3.1":                      37_000_000_000,
+    "deepseek-ai/DeepSeek-V3.2":                      37_000_000_000,
+    "deepseek-ai/DeepSeek-V3.2-Exp":                  37_000_000_000,
+    "deepseek-ai/DeepSeek-R1":                        37_000_000_000,
+    "deepseek-ai/DeepSeek-R1-0528":                   37_000_000_000,
+    "deepseek-ai/DeepSeek-V4-Pro":                    50_000_000_000,
+    "deepseek-ai/DeepSeek-V4-Flash":                  10_000_000_000,
+    "zai-org/GLM-4.5":                                32_000_000_000,
+    "zai-org/GLM-4.5-Air":                            12_000_000_000,
+    "zai-org/GLM-4.6":                                32_000_000_000,
+    "zai-org/GLM-4.7":                                32_000_000_000,
+    "zai-org/GLM-4.7-Flash":                          12_000_000_000,
+    "zai-org/GLM-5":                                  60_000_000_000,
+    "zai-org/GLM-5-FP8":                              60_000_000_000,
+    "zai-org/GLM-5.1":                                60_000_000_000,
+    "zai-org/GLM-5.1-FP8":                            60_000_000_000,
+    "moonshotai/Kimi-K2-Instruct":                    32_000_000_000,
+    "moonshotai/Kimi-K2-Thinking":                    32_000_000_000,
+    "MiniMaxAI/MiniMax-M2":                           10_000_000_000,
+    "MiniMaxAI/MiniMax-M2.5":                         10_000_000_000,
+    "XiaomiMiMo/MiMo-V2.5":                            7_000_000_000,
+    "XiaomiMiMo/MiMo-V2.5-Pro":                       11_000_000_000,
+    "XiaomiMiMo/MiMo-V2-Flash":                        3_000_000_000,
+    "google/gemma-4-26b-a4b-it":                       4_000_000_000,
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16":      3_000_000_000,
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8":       3_000_000_000,
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16":  12_000_000_000,
+    # OpenAI gpt-oss MoE family — 5B active for 20b/120b.
+    "openai/gpt-oss-20b":                              3_600_000_000,
+    "openai/gpt-oss-120b":                             5_100_000_000,
+}
+
+# Hardcoded parameter counts for frontier models that HF's API leaves with
+# missing safetensors/gguf/config metadata. Used as a last-resort fallback
+# inside :func:`_extract_param_count` so these models still enter the cache
+# and become rankable. Maintain only entries that lack a size hint in the
+# model ID itself (those are handled by :func:`_extract_size_hint_from_id`).
+_KNOWN_PARAM_COUNTS: dict[str, int] = {
+    "microsoft/phi-4":                          14_700_000_000,
+    "microsoft/Phi-4-mini-instruct":             3_800_000_000,
+    "microsoft/Phi-4-multimodal-instruct":       5_600_000_000,
+    "microsoft/Phi-4-reasoning":                14_700_000_000,
+    "microsoft/Phi-4-reasoning-plus":            14_700_000_000,
+    "openai/gpt-oss-20b":                       20_000_000_000,
+    "openai/gpt-oss-120b":                     120_000_000_000,
+    # IBM Granite 4.0 family
+    "ibm-granite/granite-4.0-h-small":          32_000_000_000,
+    "ibm-granite/granite-4.0-h-tiny":            7_000_000_000,
+    "ibm-granite/granite-3.3-8b-instruct":       8_000_000_000,
+    "ibm-granite/granite-3.3-2b-instruct":       2_000_000_000,
+    # AllenAI Olmo-3
+    "allenai/Olmo-3-7B-Instruct":                7_000_000_000,
+    "allenai/Olmo-3-1025-7B":                    7_000_000_000,
+    # Llama 4 MoE totals — repo names advertise the *active* size (17B) but
+    # the total weight footprint is much larger (16 / 128 experts × shared
+    # backbone). Without this override the cache scores them as 17B dense
+    # models, which lets them appear in 12-16 GB rankings they can't run.
+    "meta-llama/Llama-4-Scout-17B-16E-Instruct":     109_000_000_000,
+    "meta-llama/Llama-4-Maverick-17B-128E-Instruct": 400_000_000_000,
+    "deepseek-ai/DeepSeek-R1":                 671_000_000_000,
+    "deepseek-ai/DeepSeek-R1-0528":            671_000_000_000,
+    "deepseek-ai/DeepSeek-V3":                 671_000_000_000,
+    "deepseek-ai/DeepSeek-V3-0324":            671_000_000_000,
+    "deepseek-ai/DeepSeek-V3.1":               671_000_000_000,
+    "deepseek-ai/DeepSeek-V3.2":               685_000_000_000,
+    "deepseek-ai/DeepSeek-V4-Pro":             720_000_000_000,
+    "deepseek-ai/DeepSeek-V4-Flash":            45_000_000_000,
+    "moonshotai/Kimi-K2-Instruct":            1_026_000_000_000,
+    "moonshotai/Kimi-K2-Thinking":            1_026_000_000_000,
+    "XiaomiMiMo/MiMo-V2.5":                     58_000_000_000,
+    "XiaomiMiMo/MiMo-V2.5-Pro":                 58_000_000_000,
+    "XiaomiMiMo/MiMo-V2-Flash":                 16_000_000_000,
+    "zai-org/GLM-4.5":                         355_000_000_000,
+    "zai-org/GLM-4.5-Air":                     106_000_000_000,
+    "zai-org/GLM-4.6":                         355_000_000_000,
+    "zai-org/GLM-4.7":                         355_000_000_000,
+    "zai-org/GLM-4.7-Flash":                    30_000_000_000,
+    "zai-org/GLM-5":                           754_000_000_000,
+    "zai-org/GLM-5-FP8":                       754_000_000_000,
+    "zai-org/GLM-5.1":                         754_000_000_000,
+    "zai-org/GLM-5.1-FP8":                     754_000_000_000,
+    "MiniMaxAI/MiniMax-M2":                    230_000_000_000,
+    "MiniMaxAI/MiniMax-M2.5":                  230_000_000_000,
+    "stepfun-ai/Step-3.5-Flash":                30_000_000_000,
+}
+
+
 def _extract_param_count(model_data: dict) -> int:
-    """Extract parameter count from model data."""
+    """Extract parameter count from model data.
+
+    Resolution order:
+      1. safetensors metadata (most reliable when present)
+      2. gguf metadata
+      3. config (estimated from hidden_size + num_layers + vocab_size)
+      4. name-based size hint (e.g. ``Qwen/Qwen3-32B`` → 32B)
+      5. ``_KNOWN_PARAM_COUNTS`` lookup (for models like ``microsoft/phi-4``
+         that have neither indexed metadata nor a size in the repo name)
+
+    Returns 0 if none of the above succeed (caller drops the model).
+    """
     # Try safetensors metadata first
     safetensors = model_data.get("safetensors")
     if safetensors and isinstance(safetensors, dict):
@@ -211,6 +323,22 @@ def _extract_param_count(model_data: dict) -> int:
     if hidden and layers and vocab:
         # Rough: 12 * layers * hidden^2 + vocab * hidden * 2
         return 12 * layers * hidden * hidden + vocab * hidden * 2
+
+    # Fall back to ID-based hints — these are the recourse when HF doesn't
+    # index safetensors metadata for a repo (e.g. Qwen3-32B, phi-4, Mistral
+    # Small 3.2 24B). Without this branch these popular models silently
+    # disappear from the ranker.
+    #
+    # ``_KNOWN_PARAM_COUNTS`` is checked *before* the name hint because it
+    # is curated: for Llama-4-Scout-17B-16E (16-expert MoE) the name hint
+    # gives 17B (the active size) but the actual VRAM footprint is 109B.
+    model_id = model_data.get("id", "") or ""
+    known = _KNOWN_PARAM_COUNTS.get(model_id)
+    if known and known > 0:
+        return known
+    name_hint = _extract_size_hint_from_id(model_id)
+    if name_hint and name_hint > 0:
+        return name_hint
 
     return 0
 
@@ -261,19 +389,45 @@ def _parse_model(data: dict) -> ModelInfo | None:
     if param_count == 0:
         return None
 
-    # MoE detection
-    num_experts = config.get("num_local_experts", 0)
-    is_moe = num_experts > 0
+    # MoE detection. HF model configs use a variety of keys for the
+    # expert-count field — try the common ones before giving up.
+    num_experts = 0
+    for k in (
+        "num_local_experts",
+        "num_experts",
+        "n_routed_experts",
+        "moe_num_experts",
+        "num_moe_experts",
+        "n_local_experts",
+    ):
+        v = config.get(k, 0)
+        if isinstance(v, int) and v > num_experts:
+            num_experts = v
+    experts_per_tok = 0
+    for k in (
+        "num_experts_per_tok",
+        "moe_topk",
+        "moe_top_k",
+        "num_experts_per_token",
+        "top_k",
+    ):
+        v = config.get(k, 0)
+        if isinstance(v, int) and v > experts_per_tok:
+            experts_per_tok = v
+
+    # Known-frontier MoE registry: when HF config lacks expert metadata, fall
+    # back to a curated lookup. The total/active values come from each model's
+    # release card.
+    known_moe_active = _KNOWN_MOE_ACTIVE_PARAMS.get(model_id)
+    is_moe = num_experts > 0 or known_moe_active is not None
     active_params = None
     if is_moe:
-        experts_per_tok = config.get("num_experts_per_tok", 2)
-        if num_experts > 0:
-            active_ratio = experts_per_tok / num_experts
-            # Active params = non-expert params + expert_ratio * expert_params
-            # Rough: active ≈ param_count * (1 - expert_fraction + expert_fraction * active_ratio)
-            # For simplicity: active ≈ param_count * active_ratio (for heavily MoE models)
-            # Better estimate: typically ~40-50% of MoE total are in experts
-            expert_fraction = 0.6  # rough estimate
+        if known_moe_active is not None:
+            active_params = known_moe_active
+        elif num_experts > 0:
+            ept = experts_per_tok if experts_per_tok > 0 else 2
+            active_ratio = ept / num_experts
+            expert_fraction = 0.6  # ~60% of MoE weight lives in experts
             active_params = int(
                 param_count * (1 - expert_fraction + expert_fraction * active_ratio)
             )
@@ -355,7 +509,7 @@ async def fetch_models(
     """Fetch popular models from HuggingFace Hub."""
     models: list[ModelInfo] = []
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         # Fetch top text-generation models
         params = {
             "pipeline_tag": "text-generation",
@@ -433,6 +587,158 @@ async def fetch_models(
                 if model:
                     models.append(model)
                     seen_ids.add(model.id)
+
+        # Trending (downloads accumulate slowly; trending surfaces what is
+        # *currently* generating interest — Qwen3.6, DeepSeek V4, GLM-5, etc.
+        # — which the downloads sort takes weeks to reflect).
+        for filter_value in (None, "gguf"):
+            trending_params = {
+                "pipeline_tag": "text-generation",
+                "sort": "trending",
+                "limit": str(limit),
+                "expand[]": [
+                    "config",
+                    "safetensors",
+                    "gguf",
+                    "cardData",
+                    "siblings",
+                    "evalResults",
+                ],
+            }
+            if filter_value:
+                trending_params["filter"] = filter_value
+            logger.debug(
+                f"Fetching trending {filter_value or 'all'} models from HF API"
+            )
+            try:
+                resp = await client.get(
+                    f"{HF_API_BASE}/models", params=trending_params
+                )
+                resp.raise_for_status()
+                trending_data_list = resp.json()
+            except (httpx.HTTPError, ValueError) as e:
+                # Trending is a soft addition — if HF rejects the sort key
+                # (or returns malformed JSON) just skip without aborting the
+                # whole fetch.
+                logger.debug(f"Trending fetch skipped: {e}")
+                continue
+
+            for data in trending_data_list:
+                if data.get("id") not in seen_ids:
+                    model = _parse_model(data)
+                    if model:
+                        models.append(model)
+                        seen_ids.add(model.id)
+
+        # Explicit fetch for frontier / hard-to-find models. The sort-based
+        # queries above can miss models that are very new (no download count
+        # yet) or that publish weights only to a low-traffic mirror — yet
+        # those are exactly the models a user needs to evaluate before
+        # buying hardware. Pull them by ID one at a time; failures are
+        # absorbed silently.
+        _FRONTIER_MODEL_IDS = (
+            # Newest releases that lead 2026-Q2 benchmarks
+            "moonshotai/Kimi-K2-Thinking",
+            "moonshotai/Kimi-K2-Instruct",
+            "moonshotai/Kimi-K2-Instruct-0905",
+            "XiaomiMiMo/MiMo-V2.5-Pro",
+            "XiaomiMiMo/MiMo-V2.5",
+            "XiaomiMiMo/MiMo-V2-Flash",
+            "deepseek-ai/DeepSeek-V4-Pro",
+            "deepseek-ai/DeepSeek-V4-Flash",
+            "deepseek-ai/DeepSeek-V3.2",
+            "deepseek-ai/DeepSeek-V3.2-Exp",
+            "deepseek-ai/DeepSeek-V3.1",
+            "deepseek-ai/DeepSeek-R1-0528",
+            "zai-org/GLM-5.1",
+            "zai-org/GLM-5",
+            "zai-org/GLM-5-FP8",
+            "zai-org/GLM-5.1-FP8",
+            "zai-org/GLM-4.7-Flash",
+            "zai-org/GLM-4.6",
+            "zai-org/GLM-4.5",
+            "zai-org/GLM-4.5-Air",
+            # Open-weight mid-size frontier
+            "Qwen/Qwen3.6-27B",
+            "Qwen/Qwen3-32B",
+            "Qwen/Qwen3-14B",
+            "Qwen/Qwen3-8B",
+            "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            "Qwen/Qwen3-Next-80B-A3B-Instruct",
+            "Qwen/Qwen3-235B-A22B",
+            "Qwen/Qwen3-4B-Instruct-2507",
+            # Reasoning/thinking lines that don't auto-surface via cardinality
+            "Qwen/QwQ-32B",
+            "Qwen/Qwen3-4B-Thinking-2507",
+            "deepseek-ai/DeepSeek-R1",
+            "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+            "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+            "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+            # Other current open releases
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
+            "google/gemma-3-27b-it",
+            "google/gemma-3-12b-it",
+            "google/gemma-4-31b-it",
+            "google/gemma-4-26b-a4b-it",
+            "meta-llama/Llama-3.3-70B-Instruct",
+            "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
+            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+            "microsoft/phi-4",
+            "microsoft/Phi-4-mini-instruct",
+            "mistralai/Mistral-Large-Instruct-2411",
+            "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+            "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+            "mistralai/Devstral-Small-2505",
+            "mistralai/Codestral-22B-v0.1",
+            "MiniMaxAI/MiniMax-M2",
+            "MiniMaxAI/MiniMax-M2.5",
+            # IBM Granite latest open releases
+            "ibm-granite/granite-4.0-h-small",
+            "ibm-granite/granite-4.0-h-tiny",
+            "ibm-granite/granite-3.3-8b-instruct",
+            "ibm-granite/granite-3.3-2b-instruct",
+            # AllenAI Olmo-3 (the only Olmo-3 line that shipped publicly)
+            "allenai/Olmo-3-7B-Instruct",
+            "allenai/Olmo-3-1025-7B",
+            # Nemotron 3 series
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        )
+        for model_id in _FRONTIER_MODEL_IDS:
+            if model_id in seen_ids:
+                continue
+            try:
+                resp = await client.get(
+                    f"{HF_API_BASE}/models/{model_id}",
+                    params={
+                        "expand[]": [
+                            "config",
+                            "safetensors",
+                            "gguf",
+                            "cardData",
+                            "siblings",
+                            "evalResults",
+                            "downloads",
+                            "likes",
+                            "createdAt",
+                            "lastModified",
+                        ],
+                    },
+                )
+                if resp.status_code >= 400:
+                    logger.debug(
+                        f"Frontier fetch skipped {model_id}: HTTP {resp.status_code}"
+                    )
+                    continue
+                data = resp.json()
+            except (httpx.HTTPError, ValueError) as e:
+                logger.debug(f"Frontier fetch failed for {model_id}: {e}")
+                continue
+            model = _parse_model(data)
+            if model:
+                models.append(model)
+                seen_ids.add(model.id)
 
         if include_vision:
             # 画像入力系は用途が異なるため、明示的に有効化されたときだけ取得する。
@@ -544,7 +850,7 @@ async def fetch_model_published_at(model_ids: list[str]) -> dict[str, str]:
     if not unique_ids:
         return {}
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
         tasks = [
             client.get(
                 f"{HF_API_BASE}/models/{model_id}",
