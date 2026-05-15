@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.2] - 2026-05-15
+
+### Added
+
+- Curated vision-language benchmark source (`benchmark_sources/vision.py`):
+  a 0-100 multimodal capability index (MMMU-Pro / MMBench / general
+  multimodal, 2026-05) covering the Qwen3-VL / Qwen2.5-VL / Qwen2-VL /
+  Llama-Vision / Phi-vision / Gemma-3 / Pixtral / InternVL3 lines.
+- Benchmark snapshot date is now shown under every ranking so a stale
+  recommendation is self-evident instead of silently trusted.
+- Round 3 regression suite (`tests/test_r3_regressions.py`, 20 tests),
+  each verified to fail when its fix is reverted.
+
+### Fixed
+
+- `--profile vision` generation inversion: text leaderboards do not
+  score VLMs, so the only model with a direct hit was a
+  two-generations-old Qwen2-VL-7B, which outranked the current
+  Qwen3-VL-32B even on an 80 GB GPU. Vision models now score from the
+  curated multimodal index (Qwen3-VL-32B leads at 73-76).
+- Apple Silicon partial-offload speed was estimated ~3x too low: the
+  flat 0.45x PCIe penalty was applied to unified memory, where spilled
+  weights stay in the same high-bandwidth pool. DeepSeek-R1-class
+  models on M2/M3 Ultra now report a realistic 4-15 t/s instead of
+  ~1.7. Discrete GPUs keep the 0.45x penalty.
+- Duplicate `Qwen/Qwen3-Coder-30B-A3B-Instruct` key in the LiveBench
+  fallback (silently scored 62 instead of the intended 58, and broke
+  CI lint via ruff F601).
+- `ruff format` / `ruff check` are now clean across the codebase, so
+  the Lint CI job passes (it was red for the entire 0.5.1 release).
+
+### CI
+
+- GitHub Actions updated to the Node 24 runtime (`checkout@v5`,
+  `setup-python@v6`); the Node 20 actions are deprecated from 2026-06.
+
 ## [0.5.1] - 2026-05-14
 
 ### Added
