@@ -1,15 +1,22 @@
-"""AMD GPU detection via rocm-smi."""
+"""AMD GPU detection via rocm-smi with Linux fallback probes."""
 
 from __future__ import annotations
 
 import json
 import logging
 import subprocess
+from pathlib import Path
 
-from whichllm.constants import GPU_BANDWIDTH
+from whichllm.constants import AMD_SHARED_MEMORY_APU_MARKERS, GPU_BANDWIDTH, _GiB
 from whichllm.hardware.types import GPUInfo
 
 logger = logging.getLogger(__name__)
+
+_DISPLAY_CLASSES = (
+    "vga compatible controller",
+    "3d controller",
+    "display controller",
+)
 
 
 def _lookup_bandwidth(name: str) -> float | None:
@@ -20,8 +27,129 @@ def _lookup_bandwidth(name: str) -> float | None:
     return None
 
 
+def _is_shared_memory_apu(name: str) -> bool:
+    name_upper = name.upper()
+    return any(marker in name_upper for marker in AMD_SHARED_MEMORY_APU_MARKERS)
+
+
+def _normalize_apu_vram(name: str, vram_bytes: int) -> int:
+    if _is_shared_memory_apu(name) and vram_bytes < 2 * _GiB:
+        return 0
+    return vram_bytes
+
+
+def _make_gpu(
+    name: str,
+    *,
+    vram_bytes: int = 0,
+    rocm_version: str | None = None,
+) -> GPUInfo:
+    shared_memory = _is_shared_memory_apu(name)
+    return GPUInfo(
+        name=name,
+        vendor="amd",
+        vram_bytes=_normalize_apu_vram(name, vram_bytes),
+        rocm_version=rocm_version,
+        memory_bandwidth_gbps=_lookup_bandwidth(name),
+        shared_memory=shared_memory,
+    )
+
+
+def _normalize_lspci_name(line: str) -> str:
+    parts = [p.strip() for p in line.split('"') if p.strip() and p.strip() != "\t"]
+    for i, part in enumerate(parts):
+        if part.lower() in ("advanced micro devices, inc. [amd/ati]", "amd ati"):
+            if i + 1 < len(parts):
+                return parts[i + 1]
+        if "amd" in part.lower() and "ati" in part.lower() and i + 1 < len(parts):
+            return parts[i + 1]
+    return "AMD Graphics"
+
+
+def _detect_from_lspci() -> list[str]:
+    try:
+        result = subprocess.run(
+            ["lspci", "-mm"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        logger.debug("lspci not available or timed out")
+        return []
+
+    if result.returncode != 0:
+        return []
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for line in result.stdout.splitlines():
+        line_lower = line.lower()
+        if not any(vendor in line_lower for vendor in ("amd", "ati")):
+            continue
+        if not any(display_class in line_lower for display_class in _DISPLAY_CLASSES):
+            continue
+        name = _normalize_lspci_name(line)
+        if name not in seen:
+            names.append(name)
+            seen.add(name)
+    return names
+
+
+def _read_int(path: Path) -> int:
+    try:
+        text = path.read_text().strip()
+    except OSError:
+        return 0
+    try:
+        return int(text, 0)
+    except ValueError:
+        return 0
+
+
+def _detect_from_sysfs(drm_path: Path = Path("/sys/class/drm")) -> list[GPUInfo]:
+    gpus: list[GPUInfo] = []
+    seen: set[str] = set()
+    try:
+        cards = sorted(drm_path.glob("card[0-9]*"))
+    except OSError:
+        return []
+
+    for card in cards:
+        device = card / "device"
+        try:
+            vendor = (device / "vendor").read_text().strip().lower()
+        except OSError:
+            continue
+        if vendor != "0x1002":
+            continue
+
+        name = "AMD Graphics"
+        try:
+            product_name = (device / "product_name").read_text().strip()
+            if product_name:
+                name = product_name
+        except OSError:
+            pass
+
+        vram_bytes = _read_int(device / "mem_info_vram_total")
+        key = f"{name}:{vram_bytes}"
+        if key in seen:
+            continue
+        seen.add(key)
+        gpus.append(_make_gpu(name, vram_bytes=vram_bytes))
+    return gpus
+
+
+def _detect_amd_gpus_fallback() -> list[GPUInfo]:
+    names = _detect_from_lspci()
+    if names:
+        return [_make_gpu(name) for name in names]
+    return _detect_from_sysfs()
+
+
 def detect_amd_gpus() -> list[GPUInfo]:
-    """Detect AMD GPUs using rocm-smi. Returns empty list on failure."""
+    """Detect AMD GPUs. Returns empty list on failure."""
     gpus: list[GPUInfo] = []
 
     # Get product names
@@ -33,11 +161,11 @@ def detect_amd_gpus() -> list[GPUInfo]:
             timeout=10,
         )
         if result.returncode != 0:
-            return []
+            return _detect_amd_gpus_fallback()
         product_data = json.loads(result.stdout)
     except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
         logger.debug("rocm-smi not available or failed")
-        return []
+        return _detect_amd_gpus_fallback()
 
     # Get VRAM info
     try:
@@ -48,11 +176,11 @@ def detect_amd_gpus() -> list[GPUInfo]:
             timeout=10,
         )
         if result.returncode != 0:
-            return []
+            return _detect_amd_gpus_fallback()
         mem_data = json.loads(result.stdout)
     except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
         logger.debug("Failed to get AMD VRAM info")
-        return []
+        return _detect_amd_gpus_fallback()
 
     # Get ROCm version
     rocm_version = None
@@ -90,14 +218,6 @@ def detect_amd_gpus() -> list[GPUInfo]:
             except (ValueError, TypeError):
                 pass
 
-        gpus.append(
-            GPUInfo(
-                name=name,
-                vendor="amd",
-                vram_bytes=vram_total,
-                rocm_version=rocm_version,
-                memory_bandwidth_gbps=_lookup_bandwidth(name),
-            )
-        )
+        gpus.append(_make_gpu(name, vram_bytes=vram_total, rocm_version=rocm_version))
 
     return gpus
