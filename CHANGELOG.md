@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.6] - 2026-05-18
+
+### Added
+
+- Speed estimates now include confidence metadata and an estimated tok/s range
+  in table and JSON output, so uncertain backend/model predictions are visible.
+- Windows now has an AMD/Intel GPU detection fallback via
+  `Win32_VideoController`, including 64-bit registry memory reads for GPUs
+  where `AdapterRAM` is capped around 4 GB.
+
+### Fixed
+
+- MoE speed estimates now use active-parameter metadata and a
+  bandwidth-scaled read floor, improving shared-memory APU estimates without
+  over-promoting sparse models on high-bandwidth GPUs.
+- Newer MoE model metadata now recognizes A3B-style active-parameter names.
+- Ryzen AI / Radeon 890M-class Windows iGPUs are modeled as shared-memory AMD
+  GPUs instead of CPU-only or tiny-VRAM discrete GPUs.
+- Mixed dedicated-GPU plus shared-memory-iGPU systems no longer sum unrelated
+  memory pools as one full-GPU target.
+- Windows AMD GPUs no longer receive a misleading ROCm-only warning when
+  Vulkan or DirectML backends may be valid.
+
 ## [0.5.5] - 2026-05-17
 
 ### Fixed
