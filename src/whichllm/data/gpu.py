@@ -98,6 +98,7 @@ GPU_BANDWIDTH: dict[str, float] = {
     "GTX 770": 224.3,
     "GTX 760": 192.2,
     # AMD
+    "R9700": 640.0,
     "RX 9070 XT": 640.0,
     "RX 9070": 560.0,
     "RX 9060 XT": 320.0,
@@ -110,7 +111,12 @@ GPU_BANDWIDTH: dict[str, float] = {
     "RX 6900 XT": 512.0,
     "RX 6800 XT": 512.0,
     "RX 6800": 512.0,
+    "RX 6750 XT": 432.0,
     "RX 6700 XT": 384.0,
+    "RX 6700": 320.0,
+    "RX 6650 XT": 256.0,
+    "RX 6600 XT": 256.0,
+    "RX 6600": 224.0,
     # AMD APUs / shared-memory graphics
     "Ryzen AI MAX+ 395": 256.0,
     "Ryzen AI MAX 395": 256.0,
