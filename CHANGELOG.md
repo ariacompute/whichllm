@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.5.14] - 2026-06-29
+
+### Added
+
+- Added sliding-window attention metadata to model fetching and KV cache
+  estimation, improving VRAM estimates for models that use SWA. (#124)
+- Added curated Intel Arc Pro B70 / Battlemage G31 detection and simulation,
+  including the `0xe223` PCI device ID and 32 GB VRAM / 608 GB/s bandwidth
+  defaults. (#93, #136)
+
+### Fixed
+
+- Model and benchmark metadata fetches now request `gzip, deflate` instead of
+  brotli, avoiding broken `br` responses from mirrors or intermediate servers.
+  (#128, #136)
+
 ## [0.5.13] - 2026-06-25
 
 ### Added
